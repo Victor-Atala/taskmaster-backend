@@ -1,0 +1,4 @@
+node_modules/
+taskmaster.db
+.env
+*.db-journal
