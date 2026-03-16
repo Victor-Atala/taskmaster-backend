@@ -1,121 +1,98 @@
-const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cors = require('cors');
-const path = require('path');
+import express from "express";
+import { JSONFilePreset } from "lowdb/node";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import cors from "cors";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'taskmaster_secret_2024';
+const JWT_SECRET = process.env.JWT_SECRET || "taskmaster_secret_2024";
 
 app.use(cors());
 app.use(express.json());
 
-const db = new sqlite3.Database(path.join(__dirname, 'taskmaster.db'));
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-    password TEXT NOT NULL, createdAt TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, userId INTEGER NOT NULL,
-    title TEXT NOT NULL, description TEXT DEFAULT '',
-    priority TEXT DEFAULT 'MEDIUM', category TEXT DEFAULT 'General',
-    completed INTEGER DEFAULT 0,
-    createdAt TEXT DEFAULT (datetime('now')), updatedAt TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (userId) REFERENCES users(id))`);
-});
-
-function fmt(t) { return { ...t, completed: t.completed === 1 }; }
+const db = await JSONFilePreset("db.json", { users: [], tasks: [], nextUserId: 1, nextTaskId: 1 });
 
 function auth(req, res, next) {
-  const h = req.headers['authorization'];
-  if (!h) return res.status(401).json({ error: 'Token requerido' });
-  const token = h.startsWith('Bearer ') ? h.slice(7) : h;
+  const h = req.headers["authorization"];
+  if (!h) return res.status(401).json({ error: "Token requerido" });
+  const token = h.startsWith("Bearer ") ? h.slice(7) : h;
   try { req.userId = jwt.verify(token, JWT_SECRET).userId; next(); }
-  catch { res.status(401).json({ error: 'Token invalido' }); }
+  catch { res.status(401).json({ error: "Token invalido" }); }
 }
 
-app.post('/api/v1/auth/register', (req, res) => {
+app.post("/api/v1/auth/register", async (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'Campos requeridos' });
-  db.get('SELECT id FROM users WHERE email=?', [email], (e, row) => {
-    if (row) return res.status(409).json({ error: 'Email ya registrado' });
-    const hashed = bcrypt.hashSync(password, 10);
-    db.run('INSERT INTO users (name,email,password) VALUES(?,?,?)', [name,email,hashed], function(e) {
-      if (e) return res.status(500).json({ error: e.message });
-      const token = jwt.sign({ userId: this.lastID }, JWT_SECRET, { expiresIn: '7d' });
-      res.status(201).json({ token, user: { id: this.lastID, name, email } });
-    });
-  });
+  if (!name || !email || !password) return res.status(400).json({ error: "Campos requeridos" });
+  if (db.data.users.find(u => u.email === email)) return res.status(409).json({ error: "Email ya registrado" });
+  const id = db.data.nextUserId++;
+  db.data.users.push({ id, name, email, password: bcrypt.hashSync(password, 10), createdAt: new Date().toISOString() });
+  await db.write();
+  const token = jwt.sign({ userId: id }, JWT_SECRET, { expiresIn: "7d" });
+  res.status(201).json({ token, user: { id, name, email } });
 });
 
-app.post('/api/v1/auth/login', (req, res) => {
+app.post("/api/v1/auth/login", (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Campos requeridos' });
-  db.get('SELECT * FROM users WHERE email=?', [email], (e, user) => {
-    if (!user || !bcrypt.compareSync(password, user.password))
-      return res.status(401).json({ error: 'Credenciales incorrectas' });
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
-  });
+  if (!email || !password) return res.status(400).json({ error: "Campos requeridos" });
+  const user = db.data.users.find(u => u.email === email);
+  if (!user || !bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: "Credenciales incorrectas" });
+  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
 });
 
-app.get('/api/v1/tasks', auth, (req, res) => {
-  let q = 'SELECT * FROM tasks WHERE userId=?'; const p = [req.userId];
-  if (req.query.completed !== undefined) { q += ' AND completed=?'; p.push(req.query.completed==='true'?1:0); }
-  if (req.query.category) { q += ' AND category=?'; p.push(req.query.category); }
-  q += ' ORDER BY createdAt DESC';
-  db.all(q, p, (e, rows) => { if(e) return res.status(500).json({error:e.message}); res.json(rows.map(fmt)); });
+app.get("/api/v1/tasks", auth, (req, res) => {
+  let tasks = db.data.tasks.filter(t => t.userId === req.userId);
+  if (req.query.completed !== undefined) tasks = tasks.filter(t => t.completed === (req.query.completed === "true"));
+  if (req.query.category) tasks = tasks.filter(t => t.category === req.query.category);
+  res.json(tasks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)));
 });
 
-app.post('/api/v1/tasks', auth, (req, res) => {
-  const { title, description='', priority='MEDIUM', category='General' } = req.body;
-  if (!title) return res.status(400).json({ error: 'Titulo requerido' });
-  db.run('INSERT INTO tasks (userId,title,description,priority,category) VALUES(?,?,?,?,?)',
-    [req.userId,title,description,priority,category], function(e) {
-      if(e) return res.status(500).json({error:e.message});
-      db.get('SELECT * FROM tasks WHERE id=?',[this.lastID],(e,t)=>res.status(201).json(fmt(t)));
-    });
+app.post("/api/v1/tasks", auth, async (req, res) => {
+  const { title, description = "", priority = "MEDIUM", category = "General" } = req.body;
+  if (!title) return res.status(400).json({ error: "Titulo requerido" });
+  const id = db.data.nextTaskId++;
+  const task = { id, userId: req.userId, title, description, priority, category, completed: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  db.data.tasks.push(task);
+  await db.write();
+  res.status(201).json(task);
 });
 
-app.put('/api/v1/tasks/:id', auth, (req, res) => {
-  const {id}=req.params;
-  db.get('SELECT * FROM tasks WHERE id=? AND userId=?',[id,req.userId],(e,task)=>{
-    if(!task) return res.status(404).json({error:'No encontrada'});
-    const {title,description,priority,category}=req.body;
-    db.run(`UPDATE tasks SET title=?,description=?,priority=?,category=?,updatedAt=datetime('now') WHERE id=? AND userId=?`,
-      [title??task.title,description??task.description,priority??task.priority,category??task.category,id,req.userId],
-      (e)=>{ if(e) return res.status(500).json({error:e.message});
-        db.get('SELECT * FROM tasks WHERE id=?',[id],(e,t)=>res.json(fmt(t))); });
-  });
+app.put("/api/v1/tasks/:id", auth, async (req, res) => {
+  const task = db.data.tasks.find(t => t.id === +req.params.id && t.userId === req.userId);
+  if (!task) return res.status(404).json({ error: "No encontrada" });
+  const { title, description, priority, category } = req.body;
+  if (title !== undefined) task.title = title;
+  if (description !== undefined) task.description = description;
+  if (priority !== undefined) task.priority = priority;
+  if (category !== undefined) task.category = category;
+  task.updatedAt = new Date().toISOString();
+  await db.write();
+  res.json(task);
 });
 
-app.delete('/api/v1/tasks/:id', auth, (req, res) => {
-  const {id}=req.params;
-  db.get('SELECT id FROM tasks WHERE id=? AND userId=?',[id,req.userId],(e,t)=>{
-    if(!t) return res.status(404).json({error:'No encontrada'});
-    db.run('DELETE FROM tasks WHERE id=? AND userId=?',[id,req.userId],(e)=>{
-      if(e) return res.status(500).json({error:e.message}); res.status(204).send(); });
-  });
+app.delete("/api/v1/tasks/:id", auth, async (req, res) => {
+  const idx = db.data.tasks.findIndex(t => t.id === +req.params.id && t.userId === req.userId);
+  if (idx === -1) return res.status(404).json({ error: "No encontrada" });
+  db.data.tasks.splice(idx, 1);
+  await db.write();
+  res.status(204).send();
 });
 
-app.patch('/api/v1/tasks/:id/complete', auth, (req, res) => {
-  const {id}=req.params;
-  db.get('SELECT * FROM tasks WHERE id=? AND userId=?',[id,req.userId],(e,task)=>{
-    if(!task) return res.status(404).json({error:'No encontrada'});
-    db.run(`UPDATE tasks SET completed=1,updatedAt=datetime('now') WHERE id=? AND userId=?`,[id,req.userId],
-      (e)=>{ if(e) return res.status(500).json({error:e.message});
-        db.get('SELECT * FROM tasks WHERE id=?',[id],(e,t)=>res.json(fmt(t))); });
-  });
+app.patch("/api/v1/tasks/:id/complete", auth, async (req, res) => {
+  const task = db.data.tasks.find(t => t.id === +req.params.id && t.userId === req.userId);
+  if (!task) return res.status(404).json({ error: "No encontrada" });
+  task.completed = true;
+  task.updatedAt = new Date().toISOString();
+  await db.write();
+  res.json(task);
 });
 
-app.get('/api/v1/tasks/:id', auth, (req, res) => {
-  db.get('SELECT * FROM tasks WHERE id=? AND userId=?',[req.params.id,req.userId],(e,t)=>{
-    if(!t) return res.status(404).json({error:'No encontrada'}); res.json(fmt(t)); });
+app.get("/api/v1/tasks/:id", auth, (req, res) => {
+  const task = db.data.tasks.find(t => t.id === +req.params.id && t.userId === req.userId);
+  if (!task) return res.status(404).json({ error: "No encontrada" });
+  res.json(task);
 });
 
-app.get('/', (req, res) => res.json({ status: 'TaskMaster API running', version: '1.0.0' }));
-app.listen(PORT, () => console.log(`TaskMaster API en puerto ${PORT}`));
+app.get("/", (req, res) => res.json({ status: "TaskMaster API running", version: "1.0.0" }));
+app.listen(PORT, () => console.log("TaskMaster API en puerto " + PORT));
